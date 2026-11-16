@@ -1,7 +1,7 @@
 {
   "id": "webdavrsync",
   "name": "WebDAVrSync",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "minAppVersion": "1.4.0",
   "description": "轻量双向 WebDAV 同步（fork：内容哈希、FODI token 下载、干跑、白名单、重试）",
   "author": "撞强",

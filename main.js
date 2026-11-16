@@ -2358,11 +2358,20 @@ class WebDAVrSyncPlugin extends Plugin {
 
     this.statusBarEl = this.addStatusBarItem();
     this.statusBarEl.addClass('webdavrsync-status');
+    // 固定单行显示，避免长文件名把状态栏撑成两行（不同窗口看起来样式不一致）
     this.statusBarEl.style.cursor = 'pointer';
+    this.statusBarEl.style.whiteSpace = 'nowrap';
+    this.statusBarEl.style.overflow = 'hidden';
+    this.statusBarEl.style.textOverflow = 'ellipsis';
+    this.statusBarEl.style.maxWidth = '19em';
+    this.statusBarEl.style.display = 'inline-block';
+    this.statusBarEl.style.verticalAlign = 'middle';
     this.statusBarEl.setAttribute('aria-label', 'WebDAVrSync：点击立即同步');
     this.statusBarEl.addEventListener('click', () => this.runSync(true));
     this.refreshStatus();
 
+    // 加载提示：便于确认插件确实被 Obsidian 启动了（例如排在坏插件后面时不会出现）
+    new Notice('WebDAVrSync 插件已加载 v' + (this.manifest ? this.manifest.version : ''), 4000);
     this.addRibbonIcon('refresh-cw', 'WebDAVrSync：立即同步', () => this.runSync(true));
 
     this.addCommand({
@@ -2523,7 +2532,7 @@ class WebDAVrSyncPlugin extends Plugin {
             this.refreshStatus('同步中 ' + done + '/' + total);
             return;
           }
-          const shown = path && path.length > 42 ? '…' + path.slice(-41) : path || '';
+          const shown = path && path.length > 18 ? '…' + path.slice(-17) : path || '';
           this.refreshStatus(
             (this.settings.dryRun ? '[干跑] ' : '') +
               done + '/' + total + ' · ' + percent + '%' +
