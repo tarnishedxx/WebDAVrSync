@@ -2390,6 +2390,11 @@ class WebDAVrSyncPlugin extends Plugin {
       name: '测试 WebDAV 连接',
       callback: () => this.testConnection(true),
     });
+    this.addCommand({
+      id: 'diagnose-network',
+      name: '网络诊断（连通性 / 认证 / 延迟）',
+      callback: () => this.diagnoseNetwork(),
+    });
 
     this.addSettingTab(new WebDAVrSyncSettingTab(this.app, this));
 
@@ -2640,6 +2645,83 @@ class WebDAVrSyncPlugin extends Plugin {
       count +
       ' 个文件'
     );
+  }
+
+  // 网络诊断：把「连不上」拆成可判断的几步，结果弹提示并落盘到 state.lastDiagnostic
+  async diagnoseNetwork() {
+    const base = String(this.settings.serverUrl || '').trim().replace(/\/+$/, '');
+    if (!base) {
+      new Notice('WebDAVrSync：请先填写 WebDAV 地址');
+      return;
+    }
+    const results = [];
+    const timeIt = async (name, fn) => {
+      const started = Date.now();
+      const step = { name, startedAt: new Date().toISOString() };
+      try {
+        const value = await fn();
+        step.ok = true;
+        step.status = value && value.status !== undefined ? value.status : 200;
+        step.detail = value && value.detail ? value.detail : '';
+      } catch (error) {
+        step.ok = false;
+        step.status = error && error.status !== undefined ? error.status : 0;
+        step.error = error && error.message ? String(error.message).slice(0, 200) : String(error);
+      }
+      step.ms = Date.now() - started;
+      results.push(step);
+      return step;
+    };
+
+    // ① 匿名 OPTIONS：只测「能不能连上」，不涉及认证
+    await timeIt('OPTIONS 路由连通性', async () => {
+      const r = await requestUrl({ url: base + '/', method: 'OPTIONS', throw: false });
+      if (r.status < 200 || r.status >= 400) {
+        throw Object.assign(new Error('HTTP ' + r.status), { status: r.status });
+      }
+      const dav = headerValue(r.headers, 'dav') || '';
+      return { status: r.status, detail: dav ? 'DAV: ' + dav : '' };
+    });
+
+    // ② 带认证 PROPFIND：测认证与远端目录是否存在
+    await timeIt('PROPFIND 认证与目录', async () => {
+      const client = new WebDAVClient(this.settings);
+      const entry = await client.stat('');
+      return { status: 207, detail: '根目录可访问' };
+    });
+
+    // ③ 连续三次 OPTIONS：看链路是否稳定（抖动/被重置）
+    let okCount = 0;
+    for (let i = 0; i < 3; i++) {
+      const step = await timeIt('稳定性 ' + (i + 1) + '/3', async () => {
+        const r = await requestUrl({ url: base + '/', method: 'OPTIONS', throw: false });
+        if (r.status < 200 || r.status >= 400) {
+          throw Object.assign(new Error('HTTP ' + r.status), { status: r.status });
+        }
+        return { status: r.status };
+      });
+      if (step.ok) okCount++;
+    }
+
+    const failed = results.filter((r) => !r.ok);
+    const summary = results
+      .map((r) => (r.ok ? '✓' : '✗') + r.name.replace(/^稳定性 /, 'S') + ' ' + r.ms + 'ms')
+      .join(' · ');
+    const verdict = failed.length
+      ? '失败 ' + failed.length + ' 步：' + failed.map((f) => f.name).join('、')
+      : '全部通过（稳定性 ' + okCount + '/3）';
+
+    this.syncState.lastDiagnostic = {
+      time: Date.now(),
+      serverUrl: base,
+      proxyHint: '如果 OPTIONS 失败但浏览器能上网，多半是代理规则没覆盖该域名',
+      verdict,
+      results,
+    };
+    await this.saveAll();
+
+    new Notice('WebDAVrSync 诊断：' + verdict + '\n' + summary, 12000);
+    console.log('[WebDAVrSync] 网络诊断', this.syncState.lastDiagnostic);
   }
 
   async testConnection(verbose) {

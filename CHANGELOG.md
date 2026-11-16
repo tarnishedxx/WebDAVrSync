@@ -2,6 +2,17 @@
 
 All notable changes to WebDAVrSync are documented in this file.
 
+## 1.4.4 — 2026-11-16
+
+### Added
+
+- **网络诊断命令**（`命令面板 → 网络诊断（连通性 / 认证 / 延迟）`）：
+  - 匿名 `OPTIONS`：只测路由连通性，不涉及认证
+  - 带认证 `PROPFIND`：测认证与远端目录
+  - 连续 3 次 `OPTIONS`：观察链路抖动
+  - 结果弹出提示，并写入 `state.lastDiagnostic`（含每步状态、耗时、错误原文），
+    便于事后判断是「连不上」「认证失败」还是「偶发断连」。
+
 ## 1.4.3 — 2026-11-16
 
 ### Fixed
