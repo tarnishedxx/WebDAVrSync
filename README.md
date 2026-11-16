@@ -76,6 +76,18 @@ Licensed under the [MIT License](LICENSE).
 
 ---
 
+
+## 本 fork 的改动
+
+这个 fork 针对「网关式 WebDAV（如 FODI 代理 OneDrive）」做了若干修复，版本 **1.4.2**：
+
+- 内容哈希（SHA-256）判断变化，不再依赖会抖动的 etag/mtime
+- FODI 兼容下载模式（HMAC token），规避 302 直链与 Authorization 冲突
+- 干跑、路径白名单、删除前确认、失败重试、进度细化
+- 每次同步的结果落盘（`state.lastSummary` / `state.lastError`）
+
+改动清单见 [CHANGELOG.md](CHANGELOG.md)，配置项见 [配置说明.md](配置说明.md)。
+
 ## 中文说明
 
 一个轻量、开源、免费的 Obsidian 双向同步插件。只使用 WebDAV，不依赖 S3、Dropbox、OneDrive 等任何专有服务。

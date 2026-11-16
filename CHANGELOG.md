@@ -2,6 +2,43 @@
 
 All notable changes to WebDAVrSync are documented in this file.
 
+## 1.4.2 — 2026-11-16
+
+### Added
+
+- **内容哈希增量（SHA-256）**：新增 `contentHash` 开关。判断「远端有没有变」不再
+  依赖 `etag` / `mtime`，而是比对内容哈希；远端哈希写在根目录的
+  `.webdavrsync-hashes.json` 清单里（一次 GET / 一次 PUT，不是每文件一个 sidecar）。
+  清单与远端元数据不一致时会自动忽略（防止信任过期数据）。
+- **FODI 兼容下载（`downloadAuthMode: fodi-token`）**：部分网关（如 FODI）的 GET 会
+  302 到对象存储预签名直链，而运行环境跟随重定向时会把 `Authorization` 一并带过去，
+  直链因此返回 401；但去掉认证又会被网关自身拒绝。该模式改用 HMAC 签名参数
+  （`token` + `te` + `ts`）走 GET，请求中完全不带认证头。
+- **干跑模式（`dryRun`）**：只列出将要执行的上传/下载/删除，不写入任何文件。
+- **路径白名单（`includePaths`）**：每行一个目录或文件前缀，留空表示整个库。
+- **删除前确认（`verifyRemoteMissing`）**：远端列表里没看到已同步文件时，先单独
+  PROPFIND 确认再决定是否删本地，避免因目录缓存延迟误删。
+- **失败重试（`maxRetries` / `retryBaseDelayMs`）**：429 限流、5xx 与网络错误按指数退避重试。
+- **进度细化（`progressDetail`）**：状态栏显示 `已处理/总数 · 百分比 · 当前文件名`。
+- **错误落盘**：每次同步的结果写入 `state.lastSummary`（含最多 5 条错误明细），
+  异常写入 `state.lastError`，便于事后定位，无需截图。
+
+### Changed
+
+- `remoteChanged()` 改为**时间戳优先**：时间戳可用时以时间戳为准，`etag` 仅在时间戳
+  缺失时兜底。此前 OneDrive 的 etag 代次号（形如 `"{GUID},4"`）经缓存抖动会导致
+  「内容完全没变却报冲突」。
+- `get()` 接受 3xx 并手动跟随 `Location`；遇到 401 时去掉认证头重试一次。
+- `statRemoteAfterWrite()` 在上传后多次重试读取远端属性，避免把缓存里的旧 size/etag
+  记入状态。
+- 401 的诊断信息整体包进 `try`，任何意外都不会覆盖原始错误。
+
+### Fixed
+
+- 上传/下载写状态时丢失内容哈希，导致哈希清单长期为空。
+- 401 诊断代码中的属性访问缺少引号（`headers[www-authenticate]`），运行时抛
+  `ReferenceError` 并掩盖真实的 401 原因。
+
 ## 1.2.3 — 2026-11-14
 
 ### Changed

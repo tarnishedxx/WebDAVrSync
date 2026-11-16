@@ -24,7 +24,7 @@ const {
 } = require('obsidian');
 
 const PLUGIN_ID = 'webdavrsync';
-const PLUGIN_VERSION_FALLBACK = '1.2.3';
+const PLUGIN_VERSION_FALLBACK = '1.4.2';
 const STATE_VERSION = 1;
 const CONFIG_FORMAT = 'webdavrsync-config';
 const CONFIG_FORMAT_VERSION = 1;
@@ -94,6 +94,63 @@ const DEFAULT_SETTINGS = {
   backupFolder: '.webdavrsync-backups',
   backupKeep: 10,
   backupIncludePluginCode: false,
+
+  // ---- 增强项（本 fork 新增）----
+  // 干跑：只计算要做什么，不真正读写任何文件。
+  dryRun: false,
+  // 只同步这些路径（每行一个目录/文件前缀，留空=整个库）。
+  includePaths: '',
+  // 远端列表里没看到某个已同步过的文件时，先单独 PROPFIND 确认再删本地。
+  // FODI 这类带目录缓存的 WebDAV 网关必需，否则会误删本地文件。
+  verifyRemoteMissing: true,
+  // 确认「远端缺失」时的等待时间与次数（应对最终一致的目录缓存）。
+  verifyDelayMs: 1500,
+  verifyAttempts: 2,
+  // 请求失败重试：429 限流与 5xx/网络错误按指数退避重试。
+  maxRetries: 3,
+  retryBaseDelayMs: 800,
+  // 状态栏里显示百分比和当前文件。
+  progressDetail: true,
+  // 用内容哈希（SHA-256）判断变化，而不是只看 mtime/size/etag。
+  contentHash: true,
+  // 下载认证方式：
+  //   basic      —— 标准 WebDAV，GET 带 Basic 认证
+  //   fodi-token —— FODI 一类会 302 到预签名直链的网关：改用 HMAC token 走 GET，
+  //                 这样跟随重定向时不会把 Authorization 带到直链上（那边会 401）
+  downloadAuthMode: 'basic',
+};
+
+// 远端内容哈希清单：WebDAV 没有“内容哈希”属性，所以像 Zotero 的 .prop 一样，
+// 在远端根目录放一个清单文件，记录每个文件的 SHA-256。
+// 这样判断“远端到底有没有变”就不再依赖会抖动的 etag / mtime。
+const CONTENT_MANIFEST_NAME = '.webdavrsync-hashes.json';
+
+// ---------------------------------------------------------------------------
+// 共享配置（由 fork-config.json 生成，部署时自动写入）
+// 每个库的 data.json 只需要保留 remoteRoot / password / deviceName，
+// 其余设置全部从这里取默认值 —— 改一次，全库生效。
+// ---------------------------------------------------------------------------
+const FORK_DEFAULTS = {
+  "serverUrl": "https://fodi.axiszql.workers.dev",
+  "username": "tarnishedcl",
+  "downloadAuthMode": "fodi-token",
+  "contentHash": true,
+  "syncConfig": false,
+  "dryRun": false,
+  "verifyRemoteMissing": true,
+  "verifyDelayMs": 1500,
+  "verifyAttempts": 2,
+  "maxRetries": 3,
+  "retryBaseDelayMs": 800,
+  "progressDetail": true,
+  "conflictStrategy": "keep-both",
+  "allowDeletions": true,
+  "syncTrash": true,
+  "syncEmptyDirs": true,
+  "syncIntervalMinutes": 0,
+  "syncOnStart": false,
+  "syncOnChange": false,
+  "backupKeep": 10
 };
 
 const MULTISTATUS_BODY = [
@@ -199,6 +256,65 @@ function firstTagText(xml, tag) {
   );
   const match = String(xml || '').match(re);
   return match ? decodeXmlEntities(match[1].trim()) : null;
+}
+
+// 兼容不同运行环境的响应头形状：plain object、Headers 实例、Map，且不区分大小写。
+function headerValue(headers, name) {
+  if (!headers) return null;
+  const lower = String(name).toLowerCase();
+  if (typeof headers.get === 'function') {
+    try {
+      const v = headers.get(name);
+      if (v) return v;
+    } catch (error) {
+      /* ignore */
+    }
+  }
+  if (typeof headers.forEach === 'function' && typeof headers.entries === 'function') {
+    try {
+      for (const [key, value] of headers.entries()) {
+        if (String(key).toLowerCase() === lower) return value;
+      }
+    } catch (error) {
+      /* ignore */
+    }
+  }
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === lower) return headers[key];
+  }
+  return null;
+}
+
+// 计算内容的 SHA-256（十六进制）。
+async function sha256Hex(data) {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const webCrypto = getWebCrypto();
+  const subtle = (webCrypto && webCrypto.subtle) || webCrypto;
+  if (subtle && subtle.digest) {
+    const digest = await subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  throw new Error('当前环境不支持 SHA-256');
+}
+
+// HMAC-SHA256（十六进制），用于 FODI 的 token 认证。
+async function hmacSha256Hex(key, message) {
+  const webCrypto = getWebCrypto();
+  const subtle = (webCrypto && webCrypto.subtle) || webCrypto;
+  const enc = new TextEncoder();
+  const cryptoKey = await subtle.importKey(
+    'raw',
+    enc.encode(key),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await subtle.sign('HMAC', cryptoKey, enc.encode(message));
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 function base64Utf8(text) {
@@ -355,6 +471,24 @@ function compileIgnore(settings) {
   };
 }
 
+// 解析“只同步这些路径”：每行一个，支持逗号/分号分隔，自动去掉首尾斜杠。
+function parseIncludePaths(text) {
+  return String(text || '')
+    .split(/[\n,;]+/)
+    .map((item) => item.trim().replace(/^\/+/, '').replace(/\/+$/, ''))
+    .filter(Boolean);
+}
+
+// 路径是否落在白名单内（空白名单 = 全部同步）
+function pathMatchesInclude(path, prefixes) {
+  if (!prefixes || !prefixes.length) return true;
+  const normalized = normalizeRelPath(path);
+  if (!normalized) return false;
+  return prefixes.some(
+    (prefix) => normalized === prefix || normalized.indexOf(prefix + '/') === 0
+  );
+}
+
 function toBoolean(value, fallback) {
   if (typeof value === 'boolean') return value;
   if (value === 1 || value === '1' || value === 'true') return true;
@@ -364,7 +498,7 @@ function toBoolean(value, fallback) {
 
 function normalizeSettings(input) {
   const source = input && typeof input === 'object' ? input : {};
-  const merged = Object.assign({}, DEFAULT_SETTINGS, source);
+  const merged = Object.assign({}, DEFAULT_SETTINGS, FORK_DEFAULTS, source);
   return {
     serverUrl: String(merged.serverUrl || '').trim(),
     username: String(merged.username || ''),
@@ -399,6 +533,33 @@ function normalizeSettings(input) {
       merged.backupIncludePluginCode,
       DEFAULT_SETTINGS.backupIncludePluginCode
     ),
+    dryRun: toBoolean(merged.dryRun, DEFAULT_SETTINGS.dryRun),
+    includePaths:
+      typeof merged.includePaths === 'string' ? merged.includePaths : DEFAULT_SETTINGS.includePaths,
+    verifyRemoteMissing: toBoolean(
+      merged.verifyRemoteMissing,
+      DEFAULT_SETTINGS.verifyRemoteMissing
+    ),
+    verifyDelayMs: Math.max(
+      0,
+      Math.min(30000, Number(merged.verifyDelayMs) || DEFAULT_SETTINGS.verifyDelayMs)
+    ),
+    verifyAttempts: Math.max(
+      1,
+      Math.min(5, Math.floor(Number(merged.verifyAttempts) || DEFAULT_SETTINGS.verifyAttempts))
+    ),
+    maxRetries: Math.max(
+      0,
+      Math.min(10, Math.floor(Number(merged.maxRetries) || DEFAULT_SETTINGS.maxRetries))
+    ),
+    retryBaseDelayMs: Math.max(
+      100,
+      Math.min(20000, Number(merged.retryBaseDelayMs) || DEFAULT_SETTINGS.retryBaseDelayMs)
+    ),
+    progressDetail: toBoolean(merged.progressDetail, DEFAULT_SETTINGS.progressDetail),
+    contentHash: toBoolean(merged.contentHash, DEFAULT_SETTINGS.contentHash),
+    downloadAuthMode:
+      merged.downloadAuthMode === 'fodi-token' ? 'fodi-token' : 'basic',
   };
 }
 
@@ -766,6 +927,15 @@ async function decryptBackupBundle(envelope, password) {
 }
 
 function formatSummary(summary) {
+  if (summary && summary.dryRun) {
+    const p = summary.planned || {};
+    const bits = [];
+    if (p.uploads) bits.push("上传 " + p.uploads);
+    if (p.downloads) bits.push("下载 " + p.downloads);
+    if (p.deletesLocal) bits.push("本地删除 " + p.deletesLocal);
+    if (p.deletesRemote) bits.push("远端删除 " + p.deletesRemote);
+    return "[干跑] " + (bits.length ? bits.join("，") : "无变化") + "（没有写入任何文件）";
+  }
   const parts = [];
   if (summary.uploaded) parts.push('↑' + summary.uploaded);
   if (summary.downloaded) parts.push('↓' + summary.downloaded);
@@ -802,6 +972,7 @@ class SkipError extends Error {
 
 class WebDAVClient {
   constructor(settings) {
+    this.settings = settings || {};
     let serverUrl = String(settings.serverUrl || '').trim().replace(/\/+$/, '');
     if (serverUrl && !/^https?:\/\//i.test(serverUrl)) {
       serverUrl = 'http://' + serverUrl;
@@ -838,6 +1009,41 @@ class WebDAVClient {
   }
 
   async request(method, path, options) {
+    const settings = this.settings || {};
+    const maxRetries = Math.max(0, Math.min(10, Number(settings.maxRetries) || 0));
+    if (!maxRetries) return this.requestOnce(method, path, options);
+    const baseDelay = Math.max(100, Math.min(20000, Number(settings.retryBaseDelayMs) || 800));
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await this.requestOnce(method, path, options);
+      } catch (error) {
+        const status = error && typeof error.status === 'number' ? error.status : 0;
+        const retriable = status === 0 || status === 429 || (status >= 500 && status < 600);
+        if (!retriable || attempt >= maxRetries) throw error;
+        attempt++;
+        const delay = Math.min(30000, baseDelay * Math.pow(2, attempt - 1));
+        console.warn(
+          '[WebDAVrSync] ' +
+            method +
+            ' ' +
+            (path || '/') +
+            ' 失败（' +
+            status +
+            '），重试 ' +
+            attempt +
+            '/' +
+            maxRetries +
+            '，' +
+            delay +
+            'ms 后'
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  async requestOnce(method, path, options) {
     const opts = options || {};
     const headers = Object.assign({}, this.authHeaders(), opts.headers || {});
     if (opts.depth !== undefined) headers.Depth = String(opts.depth);
@@ -874,7 +1080,23 @@ class WebDAVClient {
     if (!ok) {
       let message;
       if (response.status === 401) {
-        message = '认证失败（HTTP 401）：请检查用户名和密码';
+        // 诊断信息本身绝不能把真正的错误盖掉
+        try {
+        const authState = headers.Authorization
+          ? '已发送 Authorization（长度 ' + headers.Authorization.length + '）'
+          : '没有发送 Authorization 头';
+        const bodyPreview = String(response.text || '').replace(/\s+/g, ' ').slice(0, 60);
+        const wwwAuth = headerValue(response.headers, 'www-authenticate') || '(无)';
+        message =
+          '认证失败（HTTP 401）：请检查用户名和密码；' +
+          authState +
+          '；账号长度 ' + String(this.username || '').length +
+          '；请求地址 ' + safeDecodeUri(requestUrlValue) +
+          '；响应体 "' + bodyPreview + '"' +
+          '；WWW-Authenticate: ' + wwwAuth;
+        } catch (diagnosticError) {
+          message = '认证失败（HTTP 401）：请检查用户名和密码';
+        }
       } else if (response.status === 403) {
         message = '没有权限（HTTP 403）：请检查 WebDAV 账号权限';
       } else if (response.status === 404) {
@@ -1083,9 +1305,69 @@ class WebDAVClient {
   }
 
   async get(path) {
-    const response = await this.request('GET', path, {
-      allowStatuses: [200],
-    });
+    // FODI 兼容模式：用 HMAC token 认证，请求里不带 Authorization。
+    // 这样跟随 302 到预签名直链时不会把认证头带过去（微软那边会返回 401）。
+    if (this.settings.downloadAuthMode === 'fodi-token' && this.password) {
+      const url = this.urlFor(path, false, false);
+      const parsed = new URL(url);
+      const expires = Math.floor(Date.now() / 1000) + 300;
+      let signedPath = parsed.pathname;
+      try {
+        signedPath = decodeURIComponent(parsed.pathname);
+      } catch (error) {
+        /* 保持原样 */
+      }
+      const token = await hmacSha256Hex(this.password, signedPath + ',download,' + expires);
+      const tokenUrl =
+        url + '?ts=download&te=' + expires + '&token=' + encodeURIComponent(token);
+      const response = await requestUrl({ url: tokenUrl, method: 'GET', throw: false });
+      if (response.status < 200 || response.status >= 300) {
+        throw new DavError(
+          '下载失败（HTTP ' + response.status + '）：' + path,
+          response.status,
+          path
+        );
+      }
+      return response.arrayBuffer;
+    }
+
+    // 有些 WebDAV 网关（例如 FODI 这类 OneDrive 代理）不会直接把文件吐出来，
+    // 而是返回 302 跳到对象存储的临时直链。这里接受 3xx 并手动跟随 Location，
+    // 二次请求不带 Basic 认证（直链本身就是预签名的）。
+    let response;
+    try {
+      response = await this.request('GET', path, {
+        allowStatuses: [200, 206, 301, 302, 303, 307, 308],
+      });
+    } catch (error) {
+      // 运行环境（例如 Obsidian 的 requestUrl）可能自动跟随 302 并把 Authorization
+      // 一并带到预签名直链，而直链会因此返回 401。此时去掉认证头重试一次。
+      if (error && error.status === 401) {
+        console.warn('[WebDAVrSync] 直链不接受认证头，去掉 Authorization 重试：' + path);
+        response = await requestUrl({
+          url: this.urlFor(path, false, false),
+          method: 'GET',
+          throw: false,
+        });
+        if (response.status < 200 || response.status >= 300) throw error;
+        return response.arrayBuffer;
+      }
+      throw error;
+    }
+    if (response.status >= 300 && response.status < 400) {
+      const location = headerValue(response.headers, 'location');
+      if (!location) {
+        throw new DavError('下载被重定向但缺少 Location：' + path, response.status, path);
+      }
+      response = await requestUrl({ url: location, method: 'GET', throw: false });
+      if (response.status < 200 || response.status >= 300) {
+        throw new DavError(
+          '下载失败（HTTP ' + response.status + '）：' + path,
+          response.status,
+          path
+        );
+      }
+    }
     return response.arrayBuffer;
   }
 
@@ -1162,6 +1444,11 @@ class SyncEngine {
     // 回收站存档模式：syncTrash 开启时，.trash 只增不删。
     // 清空本地回收站不会删掉远端备份，远端缺失时反而会用本地补回去。
     this.trashArchive = options.settings.syncTrash !== false;
+    // ---- 增强项 ----
+    this.dryRun = !!options.settings.dryRun;
+    this.includePrefixes = parseIncludePaths(options.settings.includePaths);
+    this.planned = { uploads: 0, downloads: 0, deletesLocal: 0, deletesRemote: 0 };
+    this.verifiedMissing = 0;
     this.trashKept = 0;
     this.isAliasPath = () => false;
     this.localAliasDirs = new Set();
@@ -1195,12 +1482,19 @@ class SyncEngine {
 
     this.onProgress(0, 0, '正在扫描本地文件…');
     const local = await this.listLocal();
+    if (this.settings.contentHash !== false) {
+      await this.computeLocalHashes(local);
+    }
 
     this.onProgress(0, 0, '正在扫描远端文件…');
     const remoteAll = await this.client.listAll({
       skipDir: (path) => this.isIgnored(path),
       concurrency: 4,
     });
+
+    if (this.settings.contentHash !== false) {
+      await this.loadRemoteManifest(remoteAll);
+    }
 
     const aliasDirs = this.localAliasDirs || new Set();
 
@@ -1236,11 +1530,15 @@ class SyncEngine {
       this.remote.set(path, entry);
     }
 
+    // 哈希清单文件本身不参与同步
+    this.remote.delete(CONTENT_MANIFEST_NAME);
+
     // 让 WebDAV 上的目录结构与本地仓库保持一致（含空目录）
     if (this.settings.syncEmptyDirs !== false) {
       const dirs = this.localDirs || new Set();
       for (const dir of dirs) {
         if (!dir || this.isIgnored(dir)) continue;
+        if (!pathMatchesInclude(dir, this.includePrefixes)) continue;
         if (this.client.dirCache.has(dir)) continue;
         try {
           await this.client.ensureDir(dir);
@@ -1265,7 +1563,16 @@ class SyncEngine {
     for (const path of local.keys()) allPaths.add(path);
     for (const path of this.remote.keys()) allPaths.add(path);
     for (const path of Object.keys(this.state.files || {})) allPaths.add(path);
-    const paths = Array.from(allPaths).sort();
+    const allSorted = Array.from(allPaths).sort();
+    // 只同步指定路径（空白名单 = 全部）
+    const paths = this.includePrefixes.length
+      ? allSorted.filter((path) => pathMatchesInclude(path, this.includePrefixes))
+      : allSorted;
+    if (this.includePrefixes.length) {
+      this.log(
+        '只同步指定路径：' + this.includePrefixes.join('、') + '（命中 ' + paths.length + ' 项）'
+      );
+    }
 
     let done = 0;
     for (const path of paths) {
@@ -1321,8 +1628,88 @@ class SyncEngine {
     this.state.version = STATE_VERSION;
     this.state.lastSync = Date.now();
     await this.onPersist();
+    this.summary.dryRun = this.dryRun;
+    this.summary.planned = this.planned;
+    this.summary.verifiedMissing = this.verifiedMissing;
+    if (this.settings.contentHash !== false) {
+      await this.saveRemoteManifest();
+    }
     this.summary.durationMs = Date.now() - started;
     return this.summary;
+  }
+
+  // 计算本地文件的内容哈希（只对普通文件）。
+  async computeLocalHashes(local) {
+    let n = 0;
+    for (const [path, entry] of local) {
+      if (!entry || entry.isDir) continue;
+      try {
+        const data = await this.adapter.readBinary(path);
+        entry.contentHash = await sha256Hex(data);
+      } catch (error) {
+        // 读不到就退回 mtime/size 判定，不影响同步
+      }
+      n++;
+      if (n % 25 === 0) this.onProgress(0, 0, '正在计算内容哈希 ' + n);
+    }
+    if (n) this.log('已计算 ' + n + ' 个文件的内容哈希');
+  }
+
+  // 读取远端哈希清单，把 contentHash 挂到远端条目上。
+  async loadRemoteManifest(remoteAll) {
+    this.remoteHashes = {};
+    try {
+      const raw = await this.client.get(CONTENT_MANIFEST_NAME);
+      const text = new TextDecoder().decode(new Uint8Array(raw));
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && parsed.files) this.remoteHashes = parsed.files;
+    } catch (error) {
+      // 没有清单（首次同步）或读取失败，退回 mtime/size/etag 判定
+      this.remoteHashes = {};
+      return;
+    }
+    let hit = 0;
+    let stale = 0;
+    for (const [path, entry] of remoteAll) {
+      const item = this.remoteHashes[path];
+      if (!item || !item.hash) continue;
+      // 清单可能过期（例如别的东西直接改了远端文件、或别的设备还没升级）。
+      // 只有清单记录的 size 与 mtime 和本次列表一致时，才敢用清单里的哈希。
+      const sizeOk = !item.size || Number(item.size) === Number(entry.size);
+      const mtimeOk =
+        !item.mtime ||
+        !Number(entry.mtime) ||
+        Math.abs(Number(item.mtime) - Number(entry.mtime)) <= 1500;
+      if (sizeOk && mtimeOk) {
+        entry.contentHash = item.hash;
+        hit++;
+      } else {
+        stale++;
+      }
+    }
+    if (stale) this.log("哈希清单有 " + stale + " 项与远端元数据不一致，已忽略（退回按时间戳判断）");
+    if (hit) this.log('远端哈希清单命中 ' + hit + ' 个文件');
+  }
+
+  // 同步结束后回写哈希清单（一次 PUT，不是每个文件一个）。
+  async saveRemoteManifest() {
+    const files = {};
+    for (const [path, entry] of Object.entries(this.state.files || {})) {
+      const hash = entry.remoteHash || entry.localHash;
+      if (!hash) continue;
+      files[path] = {
+        hash,
+        size: Number(entry.remoteSize || entry.localSize) || 0,
+        mtime: Number(entry.remoteMtime) || 0,
+      };
+    }
+    const payload = JSON.stringify({ version: 1, updatedAt: Date.now(), files });
+    try {
+      await this.client.put(CONTENT_MANIFEST_NAME, new TextEncoder().encode(payload));
+      this.log('已更新远端哈希清单（' + Object.keys(files).length + ' 项）');
+    } catch (error) {
+      this.log('更新远端哈希清单失败：' + (error && error.message ? error.message : error));
+    }
   }
 
   async listLocal() {
@@ -1438,6 +1825,11 @@ class SyncEngine {
   localChanged(localEntry, stateEntry) {
     if (!stateEntry) return true;
     if (!localEntry) return true;
+    // 有内容哈希时以哈希为准：内容没变就不算改动，
+    // 避免“只改了 mtime”（解压、复制、编辑器重写）带来的无谓上传。
+    if (localEntry.contentHash && stateEntry.localHash) {
+      return localEntry.contentHash !== stateEntry.localHash;
+    }
     return (
       normalizeMtime(localEntry.mtime) !== normalizeMtime(stateEntry.localMtime) ||
       Number(localEntry.size) !== Number(stateEntry.localSize)
@@ -1447,16 +1839,20 @@ class SyncEngine {
   remoteChanged(remoteEntry, stateEntry) {
     if (!stateEntry) return true;
     if (!remoteEntry) return true;
+    // 大小不同一定是变了（比哈希更便宜、也更可靠）
     if (Number(remoteEntry.size) !== Number(stateEntry.remoteSize)) return true;
-    const currentEtag = normalizeEtag(remoteEntry.etag);
-    const savedEtag = normalizeEtag(stateEntry.remoteEtag);
-    if (currentEtag && savedEtag && currentEtag !== savedEtag) return true;
+    // 远端有内容哈希、状态里也记了 → 直接比内容，彻底绕开 etag/mtime 抖动。
+    if (remoteEntry.contentHash && stateEntry.remoteHash) {
+      return remoteEntry.contentHash !== stateEntry.remoteHash;
+    }
     const currentMtime = Number(remoteEntry.mtime) || 0;
     const savedMtime = Number(stateEntry.remoteMtime) || 0;
-    if (currentMtime && savedMtime && Math.abs(currentMtime - savedMtime) > 1500) {
-      return true;
+    if (currentMtime && savedMtime) {
+      return Math.abs(currentMtime - savedMtime) > 1500;
     }
-    return false;
+    const currentEtag = normalizeEtag(remoteEntry.etag);
+    const savedEtag = normalizeEtag(stateEntry.remoteEtag);
+    return !!(currentEtag && savedEtag && currentEtag !== savedEtag);
   }
 
   markSynced(path, localEntry, remoteEntry) {
@@ -1467,8 +1863,32 @@ class SyncEngine {
       remoteMtime: Number(remoteEntry && remoteEntry.mtime) || 0,
       remoteSize: Number(remoteEntry && remoteEntry.size) || 0,
       remoteEtag: (remoteEntry && remoteEntry.etag) || '',
-      syncedAt: Date.now(),
+      localHash: (localEntry && localEntry.contentHash) || '',
+      remoteHash:
+        (remoteEntry && remoteEntry.contentHash) ||
+        (localEntry && localEntry.contentHash) ||
+        '',
+syncedAt: Date.now(),
     };
+  }
+
+  // FODI 这类网关的目录列表有缓存：刚上传的文件可能暂时不在列表里。
+  // 在「远端看起来缺失 → 准备删本地」这个危险分支之前，单独 PROPFIND 确认一次，
+  // 避免因为列表延迟而误删本地文件。
+  async confirmRemoteExists(path) {
+    const attempts = Math.max(1, Math.min(5, Number(this.settings.verifyAttempts) || 2));
+    const delay = Math.max(0, Math.min(30000, Number(this.settings.verifyDelayMs) || 1500));
+    for (let i = 0; i < attempts; i++) {
+      if (i > 0 && delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      try {
+        const entry = await this.client.stat(path);
+        if (entry) return entry;
+      } catch (error) {
+        // 404 表示确实不存在，无需再等；其它错误（429/5xx/网络）继续重试
+        if (error && error.status === 404) return null;
+      }
+    }
+    return null;
   }
 
   async syncOne(path, localEntry, remoteEntry) {
@@ -1549,6 +1969,15 @@ class SyncEngine {
         this.log('远端已删除但本地有更新，重新上传：' + path);
         await this.upload(path, localEntry);
       } else if (this.settings.allowDeletions) {
+        if (this.settings.verifyRemoteMissing !== false) {
+          const confirmed = await this.confirmRemoteExists(path);
+          if (confirmed) {
+            this.verifiedMissing++;
+            this.log('远端列表暂未出现但实际存在，跳过删除：' + path);
+            this.markSynced(path, localEntry, confirmed);
+            return;
+          }
+        }
         await this.deleteLocal(path, stateEntry, localEntry);
       } else {
         this.log('删除同步已关闭，重新上传本地文件：' + path);
@@ -1612,6 +2041,11 @@ class SyncEngine {
       if (!remoteData) remoteData = await this.client.get(path);
       await this.writeLocal(conflictPath, remoteData);
       const conflictLocal = await this.safeStat(conflictPath);
+      try {
+        conflictLocal.contentHash = await sha256Hex(remoteData);
+      } catch (error) {
+        /* ignore */
+      }
       const conflictRemote = await this.putData(conflictPath, remoteData);
       this.markSynced(conflictPath, conflictLocal, conflictRemote);
       this.summary.uploaded++;
@@ -1620,6 +2054,11 @@ class SyncEngine {
       const localData = await this.adapter.readBinary(path);
       await this.writeLocal(conflictPath, localData);
       const conflictLocal = await this.safeStat(conflictPath);
+      try {
+        conflictLocal.contentHash = await sha256Hex(localData);
+      } catch (error) {
+        /* ignore */
+      }
       const conflictRemote = await this.putData(conflictPath, localData);
       this.markSynced(conflictPath, conflictLocal, conflictRemote);
       this.summary.uploaded++;
@@ -1629,6 +2068,11 @@ class SyncEngine {
   }
 
   async upload(path, localEntry, remoteEntry) {
+    if (this.dryRun) {
+      this.planned.uploads++;
+      this.log("[干跑] 将上传 " + path);
+      return;
+    }
     if (remoteEntry) {
       let latest;
       try {
@@ -1670,7 +2114,15 @@ class SyncEngine {
       await this.client.ensureParents(path);
       await this.client.put(path, data);
       const remoteEntry = await this.statRemoteAfterWrite(path, data.byteLength);
-      const currentLocal = { path, mtime: after.mtime, size: after.size };
+      let contentHash = (localEntry && localEntry.contentHash) || '';
+      if (!contentHash && this.settings.contentHash !== false) {
+        try {
+          contentHash = await sha256Hex(data);
+        } catch (error) {
+          /* 环境不支持 SHA-256 时退回 mtime/size */
+        }
+      }
+      const currentLocal = { path, mtime: after.mtime, size: after.size, contentHash };
       this.markSynced(path, currentLocal, remoteEntry);
       this.summary.uploaded++;
       return;
@@ -1687,25 +2139,41 @@ class SyncEngine {
   }
 
   async statRemoteAfterWrite(path, fallbackSize) {
-    try {
-      const entry = await this.client.stat(path);
-      this.remote.set(path, entry);
-      return entry;
-    } catch (error) {
-      this.log('上传成功但无法读取远端属性：' + path + '（' + error.message + '）');
-      const fallback = {
-        path,
-        isDir: false,
-        size: Number(fallbackSize) || 0,
-        mtime: Date.now(),
-        etag: '',
-      };
-      this.remote.set(path, fallback);
-      return fallback;
+    // 网关目录有缓存时，上传后立刻读到的属性可能是旧的（size / etag 尚未刷新）。
+    // 重试几次，尽量记录“确实属于这次写入”的属性，避免下次同步误判。
+    const expected = Number(fallbackSize) || 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 700 * attempt));
+      try {
+        const entry = await this.client.stat(path);
+        const sizeOk = !expected || Number(entry.size) === expected;
+        if (sizeOk || attempt === 2) {
+          this.remote.set(path, entry);
+          return entry;
+        }
+      } catch (error) {
+        if (attempt === 2) {
+          this.log('上传成功但无法读取远端属性：' + path + '（' + error.message + '）');
+        }
+      }
     }
+    const fallback = {
+      path,
+      isDir: false,
+      size: expected,
+      mtime: Date.now(),
+      etag: '',
+    };
+    this.remote.set(path, fallback);
+    return fallback;
   }
 
   async download(path, remoteEntry, stateEntry, knownLocalEntry) {
+    if (this.dryRun) {
+      this.planned.downloads++;
+      this.log("[干跑] 将下载 " + path);
+      return;
+    }
     const current = await this.safeStat(path);
     if (current && stateEntry && this.localChanged(current, stateEntry)) {
       throw new SkipError('本地文件在同步过程中被修改');
@@ -1725,6 +2193,14 @@ class SyncEngine {
     await this.writeLocal(path, data);
     const after = await this.safeStat(path);
     if (!after) throw new Error('写入后无法读取本地文件：' + path);
+    if (this.settings.contentHash !== false) {
+      try {
+        after.contentHash = await sha256Hex(data);
+        if (!remoteEntry.contentHash) remoteEntry.contentHash = after.contentHash;
+      } catch (error) {
+        /* ignore */
+      }
+    }
     this.markSynced(path, after, remoteEntry);
     this.summary.downloaded++;
   }
@@ -1768,6 +2244,11 @@ class SyncEngine {
   }
 
   async deleteRemote(path, stateEntry) {
+    if (this.dryRun) {
+      this.planned.deletesRemote++;
+      this.log("[干跑] 将删除远端 " + path);
+      return;
+    }
     // 本地仍然是“文件”时不能删远端；但如果本地这一项其实是个目录
     // （常见于目录软链接），远端同名文件就是无法同步的历史残留，可以清理。
     const localStat = await this.safeStat(path);
@@ -1799,6 +2280,11 @@ class SyncEngine {
   }
 
   async deleteLocal(path, stateEntry, localEntry) {
+    if (this.dryRun) {
+      this.planned.deletesLocal++;
+      this.log("[干跑] 将删除本地 " + path);
+      return;
+    }
     const current = await this.safeStat(path);
     if (!current) {
       delete this.state.files[path];
@@ -2030,9 +2516,20 @@ class WebDAVrSyncPlugin extends Plugin {
         onProgress: (done, total, path) => {
           if (!total) {
             this.refreshStatus(path || '同步中…');
-          } else {
-            this.refreshStatus('同步中 ' + done + '/' + total);
+            return;
           }
+          const percent = Math.min(100, Math.round((done / total) * 100));
+          if (this.settings.progressDetail === false) {
+            this.refreshStatus('同步中 ' + done + '/' + total);
+            return;
+          }
+          const shown = path && path.length > 42 ? '…' + path.slice(-41) : path || '';
+          this.refreshStatus(
+            (this.settings.dryRun ? '[干跑] ' : '') +
+              done + '/' + total + ' · ' + percent + '%' +
+              (shown ? ' · ' + shown : ''),
+            path
+          );
         },
         onPersist: () => this.saveAll(),
         onLocalWrite: (path) => this.recentWrites.set(path, Date.now()),
@@ -2048,6 +2545,25 @@ class WebDAVrSyncPlugin extends Plugin {
       if (summary.errors.length) {
         console.error('[WebDAVrSync] 同步错误', summary.errors);
       }
+      if (this.syncState) {
+        this.syncState.lastSummary = {
+          time: Date.now(),
+          dryRun: !!summary.dryRun,
+          uploaded: summary.uploaded,
+          downloaded: summary.downloaded,
+          deletedLocal: summary.deletedLocal,
+          deletedRemote: summary.deletedRemote,
+          conflicts: summary.conflicts,
+          skipped: summary.skipped,
+          verifiedMissing: summary.verifiedMissing || 0,
+          durationMs: summary.durationMs,
+          errors: (summary.errors || []).slice(0, 5).map((e) => ({
+            path: e.path,
+            message: String(e.message || "").slice(0, 300),
+          })),
+        };
+      }
+      if (this.syncState) delete this.syncState.lastError;
       this.lastSyncSummary = summary;
       this.refreshStatus(
         summary.errors.length ? '同步完成（有错误）' : '已同步 ' + timeForStatus(new Date()),
@@ -2058,6 +2574,16 @@ class WebDAVrSyncPlugin extends Plugin {
       const message = error && error.message ? error.message : String(error);
       if (manual) {
         new Notice('WebDAVrSync 同步失败：' + String(message).slice(0, 400), 10000);
+      }
+      if (this.syncState) {
+        this.syncState.lastError = {
+          time: Date.now(),
+          message: String(message).slice(0, 600),
+          serverUrl: String(this.settings.serverUrl || ""),
+          remoteRoot: String(this.settings.remoteRoot || ""),
+          usernameLength: String(this.settings.username || "").length,
+          passwordLength: String(this.settings.password || "").length,
+        };
       }
       this.refreshStatus('同步失败', message);
     } finally {
@@ -3472,6 +3998,92 @@ class WebDAVrSyncSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(!!plugin.settings.syncEmptyDirs).onChange(async (value) => {
           plugin.settings.syncEmptyDirs = value;
+          await plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl).setName('增强（本 fork 新增）').setHeading();
+
+    new Setting(containerEl)
+      .setName('干跑模式')
+      .setDesc('只扫描并列出将要执行的动作，不写入任何文件。首次上大库前建议先跑一次。')
+      .addToggle((toggle) =>
+        toggle.setValue(!!plugin.settings.dryRun).onChange(async (value) => {
+          plugin.settings.dryRun = value;
+          await plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('只同步指定路径')
+      .setDesc('每行一个目录或文件前缀（例如 notes/ 或 2026/论文.md）。留空表示整个库。')
+      .addTextArea((area) => {
+        area.inputEl.rows = 4;
+        area.setPlaceholder('留空 = 全部')
+          .setValue(plugin.settings.includePaths || '')
+          .onChange(async (value) => {
+            plugin.settings.includePaths = value;
+            await plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('删除前确认远端确实缺失')
+      .setDesc('远端列表里没看到已同步的文件时，先单独查询一次再决定删本地。FODI 这类带目录缓存的网关建议开启。')
+      .addToggle((toggle) =>
+        toggle.setValue(plugin.settings.verifyRemoteMissing !== false).onChange(async (value) => {
+          plugin.settings.verifyRemoteMissing = value;
+          await plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('缺失确认等待（毫秒）')
+      .setDesc('两次确认之间的等待时间，用来抵消目录缓存延迟。')
+      .addText((text) => {
+        text.inputEl.type = 'number';
+        text.setValue(String(plugin.settings.verifyDelayMs)).onChange(async (value) => {
+          plugin.settings.verifyDelayMs = Number(value) || 1500;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('缺失确认次数')
+      .addText((text) => {
+        text.inputEl.type = 'number';
+        text.setValue(String(plugin.settings.verifyAttempts)).onChange(async (value) => {
+          plugin.settings.verifyAttempts = Number(value) || 2;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('失败重试次数')
+      .setDesc('429 限流、5xx 与网络错误按指数退避自动重试。')
+      .addText((text) => {
+        text.inputEl.type = 'number';
+        text.setValue(String(plugin.settings.maxRetries)).onChange(async (value) => {
+          plugin.settings.maxRetries = Number(value) || 0;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('重试基础等待（毫秒）')
+      .addText((text) => {
+        text.inputEl.type = 'number';
+        text.setValue(String(plugin.settings.retryBaseDelayMs)).onChange(async (value) => {
+          plugin.settings.retryBaseDelayMs = Number(value) || 800;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('状态栏显示百分比')
+      .addToggle((toggle) =>
+        toggle.setValue(plugin.settings.progressDetail !== false).onChange(async (value) => {
+          plugin.settings.progressDetail = value;
           await plugin.saveSettings();
         })
       );
